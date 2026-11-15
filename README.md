@@ -11,6 +11,9 @@ sharing was 33% faster than with the existing Forward.
   <img src="screenshots/04-attach-send-forward.jpg" width="24%" alt="Attached photos and long-press on Send with Forward">
 </p>
 
+Demo videos of the working build: [a text message](videos/straight-forward-message.mp4) and
+[a batch of photos](videos/straight-forward-photo.mp4).
+
 ## Why
 
 People often want to share a personal update, holiday greetings or a set of vacation photos with several friends or family
