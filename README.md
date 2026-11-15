@@ -58,6 +58,42 @@ on their own. Each sharing task was then timed with and without it:
 | Large photo batch         |    43 s |             25 s |        42% |
 | **Average**               | **28 s** |      **18.7 s** |    **33%** |
 
+## How it works
+
+- **The entry points.** The Send button's long-press menu gets a **Forward** item, for a text message and inside the
+  full-screen gallery. The attachment panel gets a **Forward** button once photos are selected.
+- **The recipients.** Forward opens the standard peer selection sheet with multiple selection already on, the current chat
+  preselected and the typed text carried over, so it can still be edited there.
+- **Sending.** Nothing is forwarded under the hood: the text (and a recorded voice message, if any) is enqueued as a new
+  message in each selected chat, which is why no "Forwarded from" label appears. No server changes are needed.
+- **Photos.** The media picker sends its selection to each chat separately, and gives every chat its own album grouping keys,
+  so each recipient gets the album as one group. Captions typed on the photos are kept, and the chat input is cleared after
+  sending, as with a normal media send.
+- **The existing Forward.** It hides "Forwarded from" when every message was written by you and is not itself a forward,
+  unless you chose to show the sender in the forward options. The patch also fixes Saved Messages appearing twice in the
+  forward sheet when a chat is preselected.
+
+## Applying the change
+
+`straight-forward.patch` is a series of 5 commits made against the official Telegram-iOS master from early October 2026.
+From a checkout of that master:
+
+```
+git am straight-forward.patch
+```
+
+or, to apply it without commits:
+
+```
+git apply --check straight-forward.patch
+git apply straight-forward.patch
+```
+
+Then build as described in the Telegram-iOS README. Most of the feature is in a new file,
+`submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift`. The rest of the patch is small hooks in the Send
+button's menu (`ChatSendMessageActionUI`), the attachment panel and media picker (`AttachmentUI`, `MediaPickerUI`), the peer
+selection sheet (`PeerSelectionController`) and the forward flow (`ChatControllerForwardMessages.swift`).
+
 ## More
 
 The design was built directly in the source code of Telegram for iOS, for the Telegram Designers contest. The full case study,

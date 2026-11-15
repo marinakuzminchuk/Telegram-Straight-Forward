@@ -1,0 +1,1131 @@
+From bb6404435112be7537c0111bacf65fc9ec4044b0 Mon Sep 17 00:00:00 2001
+From: Marina Kuzminchuk <marina.a.kuzminchuk@gmail.com>
+Date: Sat, 31 Oct 2026 10:25:27 +0100
+Subject: [PATCH 1/5] =?UTF-8?q?feat:=20straight-forward=20=E2=80=94=20forw?=
+ =?UTF-8?q?ard=20text=20messages=20and=20gallery=20images?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Long-press the send button on a text message → "Forward" opens multi-peer
+selection pre-checked to the current chat peer.
+
+Attaching images via the gallery tab exposes a Forward button on the
+attachment panel; long-pressing the send button inside the full-screen
+gallery view also shows "Forward" in the context menu.
+
+Auto-hides the "Forwarded from:" label when all forwarded messages belong
+to the current user (no "Forwarded from: you").
+
+Fixes a duplicate Saved Messages entry in the forward sheet that arose
+because PeerSelectionControllerNode.beginSelection() was inserting
+preselected peers into foundPeers (which the chat list renders as a
+separate pinned row) in addition to selectedPeerIds/selectedPeerMap.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .../Sources/PeerSelectionController.swift     |  10 +-
+ .../Sources/AttachmentController.swift        |  12 +
+ .../Sources/AttachmentPanel.swift             |   7 +-
+ ...ChatSendMessageActionSheetController.swift |   6 +-
+ .../ChatSendMessageContextScreen.swift        |  30 +-
+ .../Sources/LegacyPaintStickersContext.swift  |  12 +-
+ .../Sources/LegacyMediaPickerGallery.swift    |   5 +-
+ .../Sources/MediaPickerScreen.swift           |  48 ++-
+ .../Sources/PeerSelectionController.swift     |   7 +-
+ .../Sources/PeerSelectionControllerNode.swift |  83 ++++-
+ ...ChatMessageDisplaySendMessageOptions.swift |   5 +-
+ .../ChatControllerBroadcastMessage.swift      | 284 ++++++++++++++++++
+ .../ChatControllerForwardMessages.swift       |   6 +-
+ .../ChatControllerOpenAttachmentMenu.swift    |  16 +-
+ 14 files changed, 495 insertions(+), 36 deletions(-)
+ create mode 100644 submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+
+diff --git a/submodules/AccountContext/Sources/PeerSelectionController.swift b/submodules/AccountContext/Sources/PeerSelectionController.swift
+index 2558c9588b..29467d4257 100644
+--- a/submodules/AccountContext/Sources/PeerSelectionController.swift
++++ b/submodules/AccountContext/Sources/PeerSelectionController.swift
+@@ -92,7 +92,9 @@ public final class PeerSelectionControllerParams {
+     public let immediatelyActivateMultipleSelection: Bool
+     public let suggestedPeers: [EnginePeer]
+     public let excludedPeerIds: Set<EnginePeer.Id>
+-    
++    public let initialInputText: NSAttributedString?
++    public let preselectedPeers: [EnginePeer]
++
+     public init(
+         context: AccountContext,
+         updatedPresentationData: (initial: PresentationData, signal: Signal<PresentationData, NoError>)? = nil,
+@@ -117,7 +119,9 @@ public final class PeerSelectionControllerParams {
+         immediatelySwitchToContacts: Bool = false,
+         immediatelyActivateMultipleSelection: Bool = false,
+         suggestedPeers: [EnginePeer] = [],
+-        excludedPeerIds: Set<EnginePeer.Id> = []
++        excludedPeerIds: Set<EnginePeer.Id> = [],
++        initialInputText: NSAttributedString? = nil,
++        preselectedPeers: [EnginePeer] = []
+     ) {
+         self.context = context
+         self.updatedPresentationData = updatedPresentationData
+@@ -143,6 +147,8 @@ public final class PeerSelectionControllerParams {
+         self.immediatelyActivateMultipleSelection = immediatelyActivateMultipleSelection
+         self.suggestedPeers = suggestedPeers
+         self.excludedPeerIds = excludedPeerIds
++        self.initialInputText = initialInputText
++        self.preselectedPeers = preselectedPeers
+     }
+ }
+ 
+diff --git a/submodules/AttachmentUI/Sources/AttachmentController.swift b/submodules/AttachmentUI/Sources/AttachmentController.swift
+index 42c41695fc..241df7a455 100644
+--- a/submodules/AttachmentUI/Sources/AttachmentController.swift
++++ b/submodules/AttachmentUI/Sources/AttachmentController.swift
+@@ -306,6 +306,7 @@ public protocol AttachmentMediaPickerContext {
+     func setCaption(_ caption: NSAttributedString)
+     func send(mode: AttachmentMediaPickerSendMode, attachmentMode: AttachmentMediaPickerAttachmentMode, parameters: ChatSendMessageActionSheetController.SendParameters?)
+     func schedule(parameters: ChatSendMessageActionSheetController.SendParameters?)
++    func sendToMultiplePeers(_ peers: [EnginePeer], mode: AttachmentMediaPickerSendMode, context: AccountContext, completion: @escaping () -> Void)
+ }
+ 
+ public extension AttachmentMediaPickerContext {
+@@ -368,6 +369,10 @@ public extension AttachmentMediaPickerContext {
+     func schedule(parameters: ChatSendMessageActionSheetController.SendParameters?) {
+     }
+ 
++    func sendToMultiplePeers(_ peers: [EnginePeer], mode: AttachmentMediaPickerSendMode, context: AccountContext, completion: @escaping () -> Void) {
++        completion()
++    }
++
+     func mainButtonAction() {
+     }
+ 
+@@ -457,6 +462,7 @@ public class AttachmentController: ViewController, MinimizableController {
+ 
+     public var willDismiss: () -> Void = {}
+     public var didDismiss: () -> Void = {}
++    public var forward: ((NSAttributedString) -> Void)?
+ 
+     public var mediaPickerContext: AttachmentMediaPickerContext? {
+         get {
+@@ -879,6 +885,8 @@ public class AttachmentController: ViewController, MinimizableController {
+                 return currentController.getCurrentSendMessageContextMediaPreview?()
+             }
+ 
++            self.panel.forward = controller.forward
++
+             if let updatedPresentationData = controller.updatedPresentationData {
+                 self.presentationDataDisposable = (updatedPresentationData.signal
+                 |> deliverOnMainQueue).start(next: { [weak self] presentationData in
+@@ -1676,6 +1684,10 @@ public class AttachmentController: ViewController, MinimizableController {
+         self.node.updateSelectionCount(count, animated: false)
+     }
+ 
++    public func switchToTab(_ type: AttachmentButtonType) {
++        let _ = self.node.switchToController(type)
++    }
++
+     private var node: Node {
+         return self.displayNode as! Node
+     }
+diff --git a/submodules/AttachmentUI/Sources/AttachmentPanel.swift b/submodules/AttachmentUI/Sources/AttachmentPanel.swift
+index 3b614c05aa..36ff08cf6a 100644
+--- a/submodules/AttachmentUI/Sources/AttachmentPanel.swift
++++ b/submodules/AttachmentUI/Sources/AttachmentPanel.swift
+@@ -1143,6 +1143,7 @@ final class AttachmentPanel: ASDisplayNode, ASScrollViewDelegate, ASGestureRecog
+     var getNavigationController: () -> NavigationController? = { nil }
+ 
+     var getCurrentSendMessageContextMediaPreview: (() -> ChatSendMessageContextScreenMediaPreview?)?
++    var forward: ((NSAttributedString) -> Void)?
+ 
+     var onMainButtonPressed: () -> Void = { }
+     var onSecondaryButtonPressed: () -> Void = { }
+@@ -1492,7 +1493,11 @@ final class AttachmentPanel: ASDisplayNode, ASScrollViewDelegate, ASGestureRecog
+                         },
+                         reactionItems: effectItems,
+                         availableMessageEffects: availableMessageEffects,
+-                        isPremium: hasPremium
++                        isPremium: hasPremium,
++                        forward: strongSelf.forward.map { forwardAction in
++                            let captionText = textInputPanelNode.inputTextState.inputText
++                            return { forwardAction(captionText) }
++                        }
+                     )
+                     strongSelf.presentInGlobalOverlay(controller)
+                 })
+diff --git a/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageActionSheetController.swift b/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageActionSheetController.swift
+index 8cc6b14ca3..ef1364ad60 100644
+--- a/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageActionSheetController.swift
++++ b/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageActionSheetController.swift
+@@ -91,7 +91,8 @@ public func makeChatSendMessageActionSheetController(
+     reactionItems: [ReactionItem]? = nil,
+     availableMessageEffects: AvailableMessageEffects? = nil,
+     isPremium: Bool = false,
+-    richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil
++    richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil,
++    forward: (() -> Void)? = nil
+ ) -> ChatSendMessageActionSheetController {
+     return ChatSendMessageContextScreen(
+         initialData: initialData,
+@@ -113,6 +114,7 @@ public func makeChatSendMessageActionSheetController(
+         reactionItems: reactionItems,
+         availableMessageEffects: availableMessageEffects,
+         isPremium: isPremium,
+-        richTextPreview: richTextPreview
++        richTextPreview: richTextPreview,
++        forward: forward
+     )
+ }
+diff --git a/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageContextScreen.swift b/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageContextScreen.swift
+index fbfdb413bd..ce56a8a838 100644
+--- a/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageContextScreen.swift
++++ b/submodules/ChatSendMessageActionUI/Sources/ChatSendMessageContextScreen.swift
+@@ -99,6 +99,7 @@ final class ChatSendMessageContextScreenComponent: Component {
+     let availableMessageEffects: AvailableMessageEffects?
+     let isPremium: Bool
+     let richTextPreview: ChatSendMessageContextScreenRichTextPreview?
++    let forward: (() -> Void)?
+ 
+     init(
+         initialData: ChatSendMessageContextScreen.InitialData,
+@@ -120,7 +121,8 @@ final class ChatSendMessageContextScreenComponent: Component {
+         reactionItems: [ReactionItem]?,
+         availableMessageEffects: AvailableMessageEffects?,
+         isPremium: Bool,
+-        richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil
++        richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil,
++        forward: (() -> Void)? = nil
+     ) {
+         self.initialData = initialData
+         self.context = context
+@@ -142,6 +144,7 @@ final class ChatSendMessageContextScreenComponent: Component {
+         self.availableMessageEffects = availableMessageEffects
+         self.isPremium = isPremium
+         self.richTextPreview = richTextPreview
++        self.forward = forward
+     }
+ 
+     static func ==(lhs: ChatSendMessageContextScreenComponent, rhs: ChatSendMessageContextScreenComponent) -> Bool {
+@@ -609,17 +612,32 @@ final class ChatSendMessageContextScreenComponent: Component {
+                                 return
+                             }
+                             self.animateOutToEmpty = true
+-                            
++
+                             let sendParameters = ChatSendMessageActionSheetController.SendParameters(
+                                 effect: self.selectedMessageEffect.flatMap({ ChatSendMessageActionSheetController.SendParameters.Effect(id: $0.id) }),
+                                 textIsAboveMedia: self.mediaCaptionIsAbove
+                             )
+-                            
++
+                             component.schedule(sendParameters)
+                             self.environment?.controller()?.dismiss()
+                         }
+                     )))
+                 }
++                if let forwardAction = component.forward {
++                    items.append(.action(ContextMenuActionItem(
++                        id: AnyHashable("forward"),
++                        text: "Forward",
++                        icon: { theme in
++                            return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Forward"), color: theme.contextMenu.primaryColor)
++                        }, action: { [weak self] _, _ in
++                            guard let self else {
++                                return
++                            }
++                            self.environment?.controller()?.dismiss()
++                            forwardAction()
++                        }
++                    )))
++                }
+                 if canMakePaidContent {
+                     let title: String
+                     let titleLayout: ContextMenuActionItemTextLayout
+@@ -1512,7 +1530,8 @@ public class ChatSendMessageContextScreen: ViewControllerComponentContainer, Cha
+         reactionItems: [ReactionItem]?,
+         availableMessageEffects: AvailableMessageEffects?,
+         isPremium: Bool,
+-        richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil
++        richTextPreview: ChatSendMessageContextScreenRichTextPreview? = nil,
++        forward: (() -> Void)? = nil
+     ) {
+         self.context = context
+ 
+@@ -1538,7 +1557,8 @@ public class ChatSendMessageContextScreen: ViewControllerComponentContainer, Cha
+                 reactionItems: reactionItems,
+                 availableMessageEffects: availableMessageEffects,
+                 isPremium: isPremium,
+-                richTextPreview: richTextPreview
++                richTextPreview: richTextPreview,
++                forward: forward
+             ),
+             navigationBarAppearance: .none,
+             statusBarStyle: .none,
+diff --git a/submodules/LegacyMediaPickerUI/Sources/LegacyPaintStickersContext.swift b/submodules/LegacyMediaPickerUI/Sources/LegacyPaintStickersContext.swift
+index de1b8a4026..2b422bd376 100644
+--- a/submodules/LegacyMediaPickerUI/Sources/LegacyPaintStickersContext.swift
++++ b/submodules/LegacyMediaPickerUI/Sources/LegacyPaintStickersContext.swift
+@@ -608,7 +608,8 @@ private final class LegacyMediaPickerSendActionMenuReferenceContentSource: Conte
+ public func makeLegacyMediaPickerSendActionMenuPresenter(
+     context: AccountContext,
+     presentationData: PresentationData? = nil,
+-    presentInGlobalOverlay: ((ViewController) -> Void)? = nil
++    presentInGlobalOverlay: ((ViewController) -> Void)? = nil,
++    forward: (() -> Void)? = nil
+ ) -> LegacyMediaPickerSendActionMenuPresenter {
+     return { sourceView, canSendSilently, canSendWhenOnline, canSchedule, reminder, hasTimer, sendSilently, sendWhenOnline, schedule, sendWithTimer in
+         guard sourceView.window != nil else {
+@@ -654,6 +655,15 @@ public func makeLegacyMediaPickerSendActionMenuPresenter(
+             })))
+         }
+ 
++        if let forwardAction = forward {
++            items.append(.action(ContextMenuActionItem(text: "Forward", icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Forward"), color: theme.contextMenu.primaryColor)
++            }, action: { _, f in
++                f(.default)
++                forwardAction()
++            })))
++        }
++
+         guard !items.isEmpty else {
+             return false
+         }
+diff --git a/submodules/MediaPickerUI/Sources/LegacyMediaPickerGallery.swift b/submodules/MediaPickerUI/Sources/LegacyMediaPickerGallery.swift
+index 68e48c1681..61947d6b17 100644
+--- a/submodules/MediaPickerUI/Sources/LegacyMediaPickerGallery.swift
++++ b/submodules/MediaPickerUI/Sources/LegacyMediaPickerGallery.swift
+@@ -138,7 +138,8 @@ func presentLegacyMediaPickerGallery(
+     finishedTransitionIn: @escaping () -> Void,
+     willTransitionOut: @escaping () -> Void,
+     dismissAll: @escaping () -> Void,
+-    editCover: @escaping (CGSize, @escaping (UIImage) -> Void) -> Void = { _, _ in }
++    editCover: @escaping (CGSize, @escaping (UIImage) -> Void) -> Void = { _, _ in },
++    forward: (() -> Void)? = nil
+ ) -> TGModernGalleryController {
+     let reminder = peer?.id == context.account.peerId
+     let hasSilentPosting = hasSilentPosting && peer?.id != context.account.peerId
+@@ -161,7 +162,7 @@ func presentLegacyMediaPickerGallery(
+         } else {
+             context.sharedContext.presentGlobalController(controller, nil)
+         }
+-    })
++    }, forward: forward)
+     paintStickersContext.captionPanelView = {
+         return getCaptionPanelView()
+     }
+diff --git a/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift b/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
+index e557b108ce..1d87e8665a 100644
+--- a/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
++++ b/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
+@@ -263,7 +263,7 @@ public final class MediaPickerScreenImpl: ViewController, MediaPickerScreen, Att
+     fileprivate let paidMediaAllowed: Bool
+     fileprivate let subject: Subject
+     fileprivate let forCollage: Bool
+-    private let saveEditedPhotos: Bool
++    fileprivate let saveEditedPhotos: Bool
+     
+     private var explicitMultipleSelection = false
+     
+@@ -281,7 +281,8 @@ public final class MediaPickerScreenImpl: ViewController, MediaPickerScreen, Att
+     public var presentTimerPicker: (@escaping (Int32) -> Void) -> Void = { _ in }
+     public var getCaptionPanelView: () -> TGCaptionPanelView? = { return nil }
+     public var openBoost: () -> Void = { }
+-    
++    public var forward: (() -> Void)?
++
+     public var customSelection: ((MediaPickerScreenImpl, Any) -> Void)? = nil
+     
+     public var createFromScratch: () -> Void = {}
+@@ -1434,9 +1435,9 @@ public final class MediaPickerScreenImpl: ViewController, MediaPickerScreen, Att
+                 self?.controller?.dismissAll()
+             }, editCover: { [weak self] dimensions, completion in
+                 self?.controller?.editCover(dimensions, completion)
+-            })
++            }, forward: controller.forward)
+         }
+-        
++
+         fileprivate func openSelectedMedia(item: TGMediaSelectableItem, immediateThumbnail: UIImage?) {
+             guard let controller = self.controller, let interaction = controller.interaction, let (layout, _) = self.validLayout, !self.openingMedia else {
+                 return
+@@ -1474,8 +1475,8 @@ public final class MediaPickerScreenImpl: ViewController, MediaPickerScreen, Att
+             }, dismissAll: { [weak self] in
+                 self?.controller?.dismissAll()
+             }, editCover: { _, _ in
+-                
+-            })
++
++            }, forward: controller.forward)
+         }
+         
+         fileprivate func openDraft(draft: MediaEditorDraft, immediateThumbnail: UIImage?) {
+@@ -3488,11 +3489,42 @@ final class MediaPickerContext: AttachmentMediaPickerContext {
+     func schedule(parameters: ChatSendMessageActionSheetController.SendParameters?) {
+         self.controller?.interaction?.schedule(parameters)
+     }
+-    
++
++    func sendToMultiplePeers(_ peers: [EnginePeer], mode: AttachmentMediaPickerSendMode, context: AccountContext, completion: @escaping () -> Void) {
++        guard let controller = self.controller else { completion(); return }
++        let signals: [Any]
++        switch controller.subject {
++        case .assets:
++            signals = TGMediaAssetsController.resultSignals(for: controller.interaction?.selectionState, editingContext: controller.interaction?.editingState, intent: TGMediaAssetsControllerSendMediaIntent, currentItem: nil, storeAssets: true, convertToJpeg: false, descriptionGenerator: legacyAssetPickerItemGenerator(), saveEditedPhotos: controller.saveEditedPhotos) ?? []
++        case .media:
++            signals = TGMediaAssetsController.pasteboardResultSignals(for: controller.interaction?.selectionState, editingContext: controller.interaction?.editingState, intent: TGMediaAssetsControllerSendMediaIntent, currentItem: nil, descriptionGenerator: legacyAssetPickerItemGenerator()) ?? []
++        }
++        guard !signals.isEmpty else { completion(); return }
++        let silently = mode == .silently
++        let _ = (legacyAssetPickerEnqueueMessages(context: context, account: context.account, signals: signals)
++        |> deliverOnMainQueue).startStandalone(next: { items in
++            var messages = items.map { $0.message }
++            if silently {
++                messages = messages.map { message in
++                    message.withUpdatedAttributes { attrs in
++                        var attrs = attrs
++                        attrs.removeAll { $0 is NotificationInfoMessageAttribute }
++                        attrs.append(NotificationInfoMessageAttribute(flags: .muted))
++                        return attrs
++                    }
++                }
++            }
++            for peer in peers {
++                let _ = enqueueMessages(account: context.account, peerId: peer.id, messages: messages).startStandalone()
++            }
++            completion()
++        })
++    }
++
+     func mainButtonAction() {
+         self.controller?.mainButtonPressed()
+     }
+-    
++
+     func secondaryButtonAction() {
+         self.controller?.secondaryButtonPressed()
+     }
+diff --git a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
+index 8841eb0ee0..7ffae7a797 100644
+--- a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
++++ b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionController.swift
+@@ -72,6 +72,8 @@ public final class PeerSelectionControllerImpl: ViewController, PeerSelectionCon
+     private let hasCreation: Bool
+     let immediatelySwitchToContacts: Bool
+     let immediatelyActivateMultipleSelection: Bool
++    private let initialInputText: NSAttributedString?
++    let preselectedPeers: [EnginePeer]
+     
+     override public var _presentedInModal: Bool {
+         get {
+@@ -119,7 +121,9 @@ public final class PeerSelectionControllerImpl: ViewController, PeerSelectionCon
+         self.multipleSelectionLimit = params.multipleSelectionLimit
+         self.suggestedPeers = params.suggestedPeers
+         self.excludedPeerIds = params.excludedPeerIds
+-        
++        self.initialInputText = params.initialInputText
++        self.preselectedPeers = params.preselectedPeers
++
+         super.init(navigationBarPresentationData: NavigationBarPresentationData(presentationData: self.presentationData, style: .glass))
+         
+         self._hasGlassStyle = true
+@@ -371,6 +375,7 @@ public final class PeerSelectionControllerImpl: ViewController, PeerSelectionCon
+             createNewGroup: self.createNewGroup,
+             suggestedPeers: self.suggestedPeers,
+             excludedPeerIds: self.excludedPeerIds,
++            initialInputText: self.initialInputText,
+             present: { [weak self] c, a in
+                 self?.present(c, in: .window(.root), with: a)
+             },
+diff --git a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
+index ab364e757e..1da0e693ec 100644
+--- a/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
++++ b/submodules/TelegramUI/Components/PeerSelectionController/Sources/PeerSelectionControllerNode.swift
+@@ -136,6 +136,7 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+         createNewGroup: (() -> Void)?,
+         suggestedPeers: [EnginePeer],
+         excludedPeerIds: Set<EnginePeer.Id>,
++        initialInputText: NSAttributedString? = nil,
+         present: @escaping (ViewController, Any?) -> Void,
+         presentInGlobalOverlay: @escaping (ViewController, Any?) -> Void,
+         dismiss: @escaping () -> Void
+@@ -162,6 +163,11 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+         self.presentationInterfaceState = ChatPresentationInterfaceState(chatWallpaper: .builtin(WallpaperSettings()), theme: self.presentationData.theme, preferredGlassType: .default, strings: self.presentationData.strings, dateTimeFormat: self.presentationData.dateTimeFormat, nameDisplayOrder: self.presentationData.nameDisplayOrder, limitsConfiguration: self.context.currentLimitsConfiguration.with { $0 }, fontSize: self.presentationData.chatFontSize, bubbleCorners: self.presentationData.chatBubbleCorners, accountPeerId: self.context.account.peerId, mode: .standard(.default), chatLocation: .peer(id: EnginePeer.Id(0)), subject: nil, greetingData: nil, pendingUnpinnedAllMessages: false, activeGroupCallInfo: nil, hasActiveGroupCall: false, threadData: nil, isGeneralThreadClosed: nil, replyMessage: nil, accountPeerColor: nil, businessIntro: nil)
+ 
+         self.presentationInterfaceState = self.presentationInterfaceState.updatedInterfaceState { $0.withUpdatedForwardMessageIds(forwardedMessageIds) }
++        if let initialInputText = initialInputText {
++            self.presentationInterfaceState = self.presentationInterfaceState.updatedInterfaceState {
++                $0.withUpdatedComposeInputState(ChatTextInputState(inputText: initialInputText))
++            }
++        }
+         self.presentationInterfaceStatePromise.set(self.presentationInterfaceState)
+ 
+         if let _ = self.requestPeerType, showPeerTypeRequirements {
+@@ -966,20 +972,68 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+             return
+         }
+         if controller.immediatelyActivateMultipleSelection {
+-            let countPanelNode = PeersCountPanelNode(theme: self.presentationData.theme, strings: self.presentationData.strings, action: { [weak self] in
+-                guard let self else {
+-                    return
++            if let _ = self.textInputPanelNode {
++            } else {
++                let textInputPanelNode = AttachmentTextInputPanelNode(
++                    context: self.context,
++                    presentationInterfaceState: self.presentationInterfaceState,
++                    customEmojiAvailable: self.presentationInterfaceState.customEmojiAvailable,
++                    presentController: { [weak self] c in
++                        self?.present(c, nil)
++                    },
++                    presentInGlobalOverlay: { [weak self] c in
++                        self?.presentInGlobalOverlay(c, nil)
++                    },
++                    getNavigationController: { [weak self] in
++                        return self?.controller?.navigationController as? NavigationController
++                    }
++                )
++                textInputPanelNode.interfaceInteraction = self.interfaceInteraction
++                textInputPanelNode.sendMessage = { [weak self] mode, messageEffect in
++                    guard let strongSelf = self else {
++                        return
++                    }
++                    let effectiveInputText = strongSelf.presentationInterfaceState.interfaceState.composeInputState.inputText
++                    let (selectedPeers, selectedPeerMap) = strongSelf.selectedPeers
++                    if !selectedPeers.isEmpty {
++                        strongSelf.requestSend?(selectedPeers, selectedPeerMap, effectiveInputText, mode, nil, messageEffect)
++                    }
++                }
++                textInputPanelNode.updateHeight = { [weak self] _ in
++                    guard let self, let (layout, navigationBarHeight, actualNavigationBarHeight) = self.containerLayout else {
++                        return
++                    }
++                    self.containerLayoutUpdated(layout, navigationBarHeight: navigationBarHeight, actualNavigationBarHeight: actualNavigationBarHeight, transition: .animated(duration: 0.3, curve: .spring))
++
++                    // When transitioning from emoji to text keyboard the panel retains height
++                    // until the software keyboard appears. On hardware keyboards (including the
++                    // simulator) the keyboard notification never arrives with a non-zero height,
++                    // so the panel gets stuck elevated. Detect this after the animation window and
++                    // dismiss the input to bring the panel back down.
++                    guard let textInputPanelNode = self.textInputPanelNode else { return }
++                    if !textInputPanelNode.currentInputModeIsEmoji && textInputPanelNode.additionalInputHeight > 0 && (layout.inputHeight ?? 0.0) == 0.0 {
++                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
++                            guard let self,
++                                  let textInputPanelNode = self.textInputPanelNode,
++                                  let (currentLayout, _, _) = self.containerLayout else { return }
++                            if !textInputPanelNode.currentInputModeIsEmoji && textInputPanelNode.additionalInputHeight > 0 && (currentLayout.inputHeight ?? 0.0) == 0.0 {
++                                _ = textInputPanelNode.dismissInput()
++                            }
++                        }
++                    }
+                 }
+-                let (selectedPeers, selectedPeerMap) = self.selectedPeers
+-                if !self.isEmpty {
+-                    self.requestSend?(selectedPeers, selectedPeerMap, NSAttributedString(), .generic, nil, nil)
++                textInputPanelNode.updateSendButtonEnabled(false, animated: false)
++                self.addSubnode(textInputPanelNode)
++                self.textInputPanelNode = textInputPanelNode
++
++                let inputState = self.presentationInterfaceState.interfaceState.effectiveInputState
++                if !inputState.inputText.string.isEmpty {
++                    textInputPanelNode.updateInputTextState(inputState, animated: false)
+                 }
+-            })
+-            self.addSubnode(countPanelNode)
+-            self.countPanelNode = countPanelNode
+ 
+-            if let (layout, navigationBarHeight, actualNavigationBarHeight) = self.containerLayout {
+-                self.containerLayoutUpdated(layout, navigationBarHeight: navigationBarHeight, actualNavigationBarHeight: actualNavigationBarHeight, transition: .immediate)
++                if let (layout, navigationBarHeight, actualNavigationBarHeight) = self.containerLayout {
++                    self.containerLayoutUpdated(layout, navigationBarHeight: navigationBarHeight, actualNavigationBarHeight: actualNavigationBarHeight, transition: .animated(duration: 0.3, curve: .spring))
++                }
+             }
+         } else {
+             if let _ = self.textInputPanelNode {
+@@ -1050,6 +1104,8 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+             } else if let chatListNode = self.chatListNode {
+                 chatListNode.selectionCountChanged = { [weak self] count in
+                     if let self {
++                        self.textInputPanelNode?.updateSendButtonEnabled(count > 0, animated: true)
++
+                         if let _ = self.controller?.multipleSelectionLimit {
+                             self.countPanelNode?.buttonTitle = self.presentationData.strings.Premium_Gift_ContactSelection_Proceed
+                         } else {
+@@ -1066,9 +1122,14 @@ final class PeerSelectionControllerNode: ASDisplayNode {
+                         }
+                     }
+                 }
++                let preselectedPeers = self.controller?.preselectedPeers ?? []
+                 chatListNode.updateState { state in
+                     var state = state
+                     state.editing = true
++                    for peer in preselectedPeers {
++                        state.selectedPeerIds.insert(peer.id)
++                        state.selectedPeerMap[peer.id] = peer
++                    }
+                     return state
+                 }
+             }
+diff --git a/submodules/TelegramUI/Sources/Chat/ChatMessageDisplaySendMessageOptions.swift b/submodules/TelegramUI/Sources/Chat/ChatMessageDisplaySendMessageOptions.swift
+index a1a8f61d08..d989376bca 100644
+--- a/submodules/TelegramUI/Sources/Chat/ChatMessageDisplaySendMessageOptions.swift
++++ b/submodules/TelegramUI/Sources/Chat/ChatMessageDisplaySendMessageOptions.swift
+@@ -306,7 +306,10 @@ func chatMessageDisplaySendMessageOptions(selfController: ChatControllerImpl, no
+                         return nil
+                     }
+                     return makeRichTextSendPreview(context: selfController.context, content: selfController.presentationInterfaceState.interfaceState.composeInputState.content, mediaPreview: mediaPreview)
+-                }()
++                }(),
++                forward: { [weak selfController] in
++                    selfController?.forwardCurrentMessage()
++                }
+             )
+             selfController.sendMessageActionsController = controller
+             if layout.isNonExclusive {
+diff --git a/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+new file mode 100644
+index 0000000000..0cee396aa5
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+@@ -0,0 +1,284 @@
++import Foundation
++import TelegramPresentationData
++import AccountContext
++import TelegramCore
++import SwiftSignalKit
++import TextFormat
++import ChatInterfaceState
++import UndoUI
++import LocalMediaResources
++import AudioWaveform
++import AttachmentUI
++
++extension ChatControllerImpl {
++    func forwardCurrentMessage(overrideText: NSAttributedString? = nil) {
++        let inputText = overrideText ?? self.presentationInterfaceState.interfaceState.composeInputState.inputText
++        let mediaDraftState = overrideText == nil ? self.presentationInterfaceState.interfaceState.mediaDraftState : nil
++
++        guard inputText.length > 0 || mediaDraftState != nil else {
++            return
++        }
++
++        let _ = self.presentVoiceMessageDiscardAlert(action: { [weak self] in
++            guard let self else {
++                return
++            }
++
++            let filter: ChatListNodePeersFilter = [.onlyWriteable, .excludeDisabled, .doNotSearchMessages]
++            let preselectedPeers: [EnginePeer] = self.presentationInterfaceState.renderedPeer?.peer.flatMap(EnginePeer.init).map { [$0] } ?? []
++            let controller = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(
++                context: self.context,
++                updatedPresentationData: self.updatedPresentationData,
++                filter: filter,
++                hasFilters: false,
++                title: "Forward",
++                multipleSelection: true,
++                selectForumThreads: false,
++                immediatelyActivateMultipleSelection: true,
++                initialInputText: inputText,
++                preselectedPeers: preselectedPeers
++            ))
++
++            let context = self.context
++            let capturedMediaDraftState = mediaDraftState
++
++            controller.multiplePeersSelected = { [weak self, weak controller] peers, _, editedText, mode, _, _ in
++                guard let strongSelf = self, let strongController = controller else {
++                    return
++                }
++                guard !peers.isEmpty else {
++                    return
++                }
++
++                strongController.dismiss()
++
++                var baseMessages: [EnqueueMessage] = []
++
++                let trimmedText = trimChatInputText(editedText)
++                for text in breakChatInputText(trimmedText) {
++                    if text.length != 0 {
++                        var attributes: [EngineMessage.Attribute] = []
++                        let entities = generateTextEntities(
++                            text.string,
++                            enabledTypes: .all,
++                            currentEntities: generateChatInputTextEntities(text, maxAnimatedEmojisInText: 0)
++                        )
++                        if !entities.isEmpty {
++                            attributes.append(TextEntitiesMessageAttribute(entities: entities))
++                        }
++                        baseMessages.append(.message(
++                            text: text.string,
++                            attributes: attributes,
++                            inlineStickers: [:],
++                            mediaReference: nil,
++                            threadId: nil,
++                            replyToMessageId: nil,
++                            replyToStoryId: nil,
++                            localGroupingKey: nil,
++                            correlationId: nil,
++                            bubbleUpEmojiOrStickersets: []
++                        ))
++                    }
++                }
++
++                if case let .audio(audio) = capturedMediaDraftState {
++                    let resource: TelegramMediaResource
++                    var waveform = audio.waveform
++                    var finalDuration: Int = Int(audio.duration)
++                    if let trimRange = audio.trimRange, trimRange.lowerBound > 0.0 || trimRange.upperBound < Double(audio.duration) {
++                        let randomId = Int64.random(in: Int64.min ... Int64.max)
++                        let tempPath = NSTemporaryDirectory() + "\(Int64.random(in: 0 ..< .max)).ogg"
++                        resource = LocalFileAudioMediaResource(randomId: randomId, path: tempPath, trimRange: trimRange)
++                        context.engine.resources.moveResourceData(id: EngineMediaResource.Id(audio.resource.id), toTempPath: tempPath)
++                        waveform = waveform.subwaveform(from: trimRange.lowerBound / Double(audio.duration), to: trimRange.upperBound / Double(audio.duration))
++                        finalDuration = Int(trimRange.upperBound - trimRange.lowerBound)
++                    } else {
++                        resource = audio.resource
++                    }
++                    let waveformBuffer = waveform.makeBitstream()
++                    baseMessages.append(.message(
++                        text: "",
++                        attributes: [],
++                        inlineStickers: [:],
++                        mediaReference: .standalone(media: TelegramMediaFile(
++                            fileId: EngineMedia.Id(namespace: Namespaces.Media.LocalFile, id: Int64.random(in: Int64.min ... Int64.max)),
++                            partialReference: nil,
++                            resource: resource,
++                            previewRepresentations: [],
++                            videoThumbnails: [],
++                            immediateThumbnailData: nil,
++                            mimeType: "audio/ogg",
++                            size: Int64(audio.fileSize),
++                            attributes: [.Audio(isVoice: true, duration: finalDuration, title: nil, performer: nil, waveform: waveformBuffer)],
++                            alternativeRepresentations: []
++                        )),
++                        threadId: nil,
++                        replyToMessageId: nil,
++                        replyToStoryId: nil,
++                        localGroupingKey: nil,
++                        correlationId: nil,
++                        bubbleUpEmojiOrStickersets: []
++                    ))
++                }
++
++                guard !baseMessages.isEmpty else {
++                    return
++                }
++
++                let isSilent = mode == .silent
++                let messages: [EnqueueMessage]
++                if isSilent {
++                    messages = baseMessages.map { message in
++                        message.withUpdatedAttributes { attrs in
++                            var attrs = attrs
++                            attrs.removeAll(where: { $0 is NotificationInfoMessageAttribute })
++                            attrs.append(NotificationInfoMessageAttribute(flags: .muted))
++                            return attrs
++                        }
++                    }
++                } else {
++                    messages = baseMessages
++                }
++
++                for peer in peers {
++                    let _ = (enqueueMessages(account: context.account, peerId: peer.id, messages: messages)
++                    |> deliverOnMainQueue).startStandalone()
++                }
++
++                strongSelf.updateChatPresentationInterfaceState(animated: true, interactive: false, {
++                    $0.updatedInterfaceState {
++                        $0.withUpdatedComposeInputState(ChatTextInputState(inputText: NSAttributedString(string: "")))
++                         .withUpdatedReplyMessageSubject(nil)
++                         .withUpdatedMediaDraftState(nil)
++                    }
++                })
++
++                let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++                let recipientCount = peers.count
++                let text: String
++                if recipientCount == 1, let peer = peers.first {
++                    var peerName = peer.id == context.account.peerId
++                        ? presentationData.strings.DialogList_SavedMessages
++                        : peer.displayTitle(strings: presentationData.strings, displayOrder: presentationData.nameDisplayOrder)
++                    peerName = peerName.replacingOccurrences(of: "**", with: "")
++                    text = presentationData.strings.Conversation_ForwardTooltip_Chat_One(peerName).string
++                } else if recipientCount > 1, let firstPeer = peers.first {
++                    var firstName = firstPeer.displayTitle(strings: presentationData.strings, displayOrder: presentationData.nameDisplayOrder)
++                    firstName = firstName.replacingOccurrences(of: "**", with: "")
++                    text = presentationData.strings.Conversation_ForwardTooltip_ManyChats_One(firstName, "\(recipientCount - 1)").string
++                } else {
++                    text = ""
++                }
++
++                if !text.isEmpty {
++                    strongSelf.present(
++                        UndoOverlayController(
++                            presentationData: presentationData,
++                            content: .forward(savedMessages: false, text: text),
++                            elevatedLayout: false,
++                            animateInAsReplacement: true,
++                            action: { _ in false }
++                        ),
++                        in: .current
++                    )
++                }
++            }
++
++            self.chatDisplayNode.dismissInput()
++            self.effectiveNavigationController?.pushViewController(controller)
++        })
++    }
++
++    func forwardFromAttachment(captionText: NSAttributedString, mediaPickerContext: AttachmentMediaPickerContext?, dismissAttachment: @escaping () -> Void) {
++        let filter: ChatListNodePeersFilter = [.onlyWriteable, .excludeDisabled, .doNotSearchMessages]
++        var excludedPeerIds = Set<EnginePeer.Id>()
++        if let currentPeerId = self.chatLocation.peerId {
++            excludedPeerIds.insert(currentPeerId)
++        }
++        let controller = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(
++            context: self.context,
++            updatedPresentationData: self.updatedPresentationData,
++            filter: filter,
++            hasFilters: false,
++            title: "Forward",
++            multipleSelection: true,
++            selectForumThreads: false,
++            immediatelyActivateMultipleSelection: true,
++            excludedPeerIds: excludedPeerIds,
++            initialInputText: captionText
++        ))
++
++        let context = self.context
++
++        controller.multiplePeersSelected = { [weak self, weak controller] peers, _, editedText, mode, _, _ in
++            guard let strongSelf = self, let strongController = controller else { return }
++            guard !peers.isEmpty else { return }
++            strongController.dismiss()
++
++            let sendMode: AttachmentMediaPickerSendMode = mode == .silent ? .silently : .generic
++
++            if let mediaPickerContext = mediaPickerContext {
++                mediaPickerContext.setCaption(editedText)
++                mediaPickerContext.sendToMultiplePeers(peers, mode: sendMode, context: context, completion: {
++                    dismissAttachment()
++                })
++            } else {
++                var baseMessages: [EnqueueMessage] = []
++                let trimmedText = trimChatInputText(editedText)
++                for text in breakChatInputText(trimmedText) {
++                    if text.length != 0 {
++                        var attributes: [EngineMessage.Attribute] = []
++                        let entities = generateTextEntities(text.string, enabledTypes: .all, currentEntities: generateChatInputTextEntities(text, maxAnimatedEmojisInText: 0))
++                        if !entities.isEmpty { attributes.append(TextEntitiesMessageAttribute(entities: entities)) }
++                        baseMessages.append(.message(text: text.string, attributes: attributes, inlineStickers: [:], mediaReference: nil, threadId: nil, replyToMessageId: nil, replyToStoryId: nil, localGroupingKey: nil, correlationId: nil, bubbleUpEmojiOrStickersets: []))
++                    }
++                }
++                let isSilent = mode == .silent
++                let messages: [EnqueueMessage] = isSilent ? baseMessages.map { message in
++                    message.withUpdatedAttributes { attrs in
++                        var attrs = attrs
++                        attrs.removeAll(where: { $0 is NotificationInfoMessageAttribute })
++                        attrs.append(NotificationInfoMessageAttribute(flags: .muted))
++                        return attrs
++                    }
++                } : baseMessages
++                for peer in peers {
++                    let _ = (enqueueMessages(account: context.account, peerId: peer.id, messages: messages) |> deliverOnMainQueue).startStandalone()
++                }
++                dismissAttachment()
++            }
++
++            let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++            let recipientCount = peers.count
++            let text: String
++            if recipientCount == 1, let peer = peers.first {
++                var peerName = peer.id == context.account.peerId
++                    ? presentationData.strings.DialogList_SavedMessages
++                    : peer.displayTitle(strings: presentationData.strings, displayOrder: presentationData.nameDisplayOrder)
++                peerName = peerName.replacingOccurrences(of: "**", with: "")
++                text = presentationData.strings.Conversation_ForwardTooltip_Chat_One(peerName).string
++            } else if recipientCount > 1, let firstPeer = peers.first {
++                var firstName = firstPeer.displayTitle(strings: presentationData.strings, displayOrder: presentationData.nameDisplayOrder)
++                firstName = firstName.replacingOccurrences(of: "**", with: "")
++                text = presentationData.strings.Conversation_ForwardTooltip_ManyChats_One(firstName, "\(recipientCount - 1)").string
++            } else {
++                text = ""
++            }
++            if !text.isEmpty {
++                strongSelf.present(
++                    UndoOverlayController(
++                        presentationData: presentationData,
++                        content: .forward(savedMessages: false, text: text),
++                        elevatedLayout: false,
++                        animateInAsReplacement: true,
++                        action: { _ in false }
++                    ),
++                    in: .current
++                )
++            }
++        }
++
++        self.chatDisplayNode.dismissInput()
++        self.effectiveNavigationController?.pushViewController(controller)
++    }
++}
+diff --git a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+index 7ec672a6ec..d4f01be110 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+@@ -157,7 +157,11 @@ extension ChatControllerImpl {
+                         }
+                         
+                         var attributes: [EngineMessage.Attribute] = []
+-                        attributes.append(ForwardOptionsMessageAttribute(hideNames: forwardOptions?.hideNames == true, hideCaptions: forwardOptions?.hideCaptions == true))
++                        // When all forwarded messages are your own, never show "Forwarded from: you".
++                        let accountPeerId = context.account.peerId
++                        let hasNotOwnMessages = messages.contains { $0.id.peerId != accountPeerId || $0.forwardInfo != nil }
++                        let shouldHideNames = !hasNotOwnMessages || (forwardOptions?.hideNames == true)
++                        attributes.append(ForwardOptionsMessageAttribute(hideNames: shouldHideNames, hideCaptions: forwardOptions?.hideCaptions == true))
+                         
+                         result.append(contentsOf: messages.map { message -> EnqueueMessage in
+                             return .forward(source: message.id, threadId: nil, grouping: .auto, attributes: attributes, correlationId: nil)
+diff --git a/submodules/TelegramUI/Sources/ChatControllerOpenAttachmentMenu.swift b/submodules/TelegramUI/Sources/ChatControllerOpenAttachmentMenu.swift
+index acbf7c2ada..bb727ea92b 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerOpenAttachmentMenu.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerOpenAttachmentMenu.swift
+@@ -487,6 +487,17 @@ extension ChatControllerImpl {
+                     self?.attachmentController = nil
+                     self?.canReadHistory.set(true)
+                 }
++                attachmentController.forward = { [weak self, weak attachmentController] captionText in
++                    guard let self else { return }
++                    let mediaPickerContext = attachmentController?.mediaPickerContext
++                    self.forwardFromAttachment(
++                        captionText: captionText,
++                        mediaPickerContext: mediaPickerContext,
++                        dismissAttachment: { [weak attachmentController] in
++                            attachmentController?.dismiss(animated: true)
++                        }
++                    )
++                }
+                 attachmentController.getSourceRect = { [weak self] in
+                     if let strongSelf = self {
+                         return strongSelf.chatDisplayNode.frameForAttachmentButton()?.offsetBy(dx: strongSelf.chatDisplayNode.supernode?.frame.minX ?? 0.0, dy: 0.0)
+@@ -521,7 +532,10 @@ extension ChatControllerImpl {
+                                 self?.presentCurrentMediaEditor(mediaReference: currentMediaReference)
+                             })
+                         }
+-                        strongSelf.presentMediaPicker(saveEditedPhotos: dataSettings.storeEditedPhotos, bannedSendPhotos: bannedSendPhotos, bannedSendVideos: bannedSendVideos, enableMultiselection: enableMultiselection, isEditingMessage: isEditingMessage, mainButton: editCurrentMediaButton, present: { controller, mediaPickerContext in
++                        strongSelf.presentMediaPicker(saveEditedPhotos: dataSettings.storeEditedPhotos, bannedSendPhotos: bannedSendPhotos, bannedSendVideos: bannedSendVideos, enableMultiselection: enableMultiselection, isEditingMessage: isEditingMessage, mainButton: editCurrentMediaButton, present: { [weak attachmentController] controller, mediaPickerContext in
++                            controller.forward = { [weak attachmentController] in
++                                attachmentController?.forward?(NSAttributedString())
++                            }
+                             let _ = currentMediaController.swap(controller)
+                             if !inputText.string.isEmpty {
+                                 mediaPickerContext?.setCaption(inputText)
+-- 
+2.50.1 (Apple Git-155)
+
+
+From b2e2234e84a525902ce7281a2ad1433be6279fa0 Mon Sep 17 00:00:00 2001
+From: Marina Kuzminchuk <marina.a.kuzminchuk@gmail.com>
+Date: Sat, 31 Oct 2026 10:26:53 +0100
+Subject: [PATCH 2/5] fix: add currentInputModeIsEmoji to
+ AttachmentTextInputPanelNode
+
+Required by PeerSelectionControllerNode to detect the emoji keyboard
+panel and avoid misidentifying it as a stuck input height.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .../Sources/AttachmentTextInputPanelNode.swift                | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/submodules/AttachmentTextInputPanelNode/Sources/AttachmentTextInputPanelNode.swift b/submodules/AttachmentTextInputPanelNode/Sources/AttachmentTextInputPanelNode.swift
+index 4d7ce99b74..5c99858238 100644
+--- a/submodules/AttachmentTextInputPanelNode/Sources/AttachmentTextInputPanelNode.swift
++++ b/submodules/AttachmentTextInputPanelNode/Sources/AttachmentTextInputPanelNode.swift
+@@ -2381,6 +2381,10 @@ public class AttachmentTextInputPanelNode: ASDisplayNode, TGCaptionPanelView, AS
+         return self.textInputNode?.isFirstResponder() ?? false
+     }
+ 
++    public var currentInputModeIsEmoji: Bool {
++        return self.currentInputMode == .emoji
++    }
++
+     public func ensureUnfocused() {
+         self.isTransitioningToTextKeyboard = false
+         self.textInputNode?.resignFirstResponder()
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 77925f437090d3607bf35287e66d832558c96058 Mon Sep 17 00:00:00 2001
+From: Marina Kuzminchuk <marina.a.kuzminchuk@gmail.com>
+Date: Sat, 31 Oct 2026 10:43:27 +0100
+Subject: [PATCH 3/5] fix: preselect current peer in forwardFromAttachment
+
+forwardFromAttachment was using excludedPeerIds (which excluded the
+current chat) instead of preselectedPeers. This caused the gallery-tab
+forward sheet to open without the current peer checked, unlike the
+text-message forward which already used preselectedPeers correctly.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .../Sources/ChatControllerBroadcastMessage.swift         | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+index 0cee396aa5..47be7d8951 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+@@ -191,10 +191,7 @@ extension ChatControllerImpl {
+ 
+     func forwardFromAttachment(captionText: NSAttributedString, mediaPickerContext: AttachmentMediaPickerContext?, dismissAttachment: @escaping () -> Void) {
+         let filter: ChatListNodePeersFilter = [.onlyWriteable, .excludeDisabled, .doNotSearchMessages]
+-        var excludedPeerIds = Set<EnginePeer.Id>()
+-        if let currentPeerId = self.chatLocation.peerId {
+-            excludedPeerIds.insert(currentPeerId)
+-        }
++        let preselectedPeers: [EnginePeer] = self.presentationInterfaceState.renderedPeer?.peer.flatMap(EnginePeer.init).map { [$0] } ?? []
+         let controller = self.context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(
+             context: self.context,
+             updatedPresentationData: self.updatedPresentationData,
+@@ -204,8 +201,8 @@ extension ChatControllerImpl {
+             multipleSelection: true,
+             selectForumThreads: false,
+             immediatelyActivateMultipleSelection: true,
+-            excludedPeerIds: excludedPeerIds,
+-            initialInputText: captionText
++            initialInputText: captionText,
++            preselectedPeers: preselectedPeers
+         ))
+ 
+         let context = self.context
+-- 
+2.50.1 (Apple Git-155)
+
+
+From b2377ae378dabf73b97732973e9bf4663bedc11e Mon Sep 17 00:00:00 2001
+From: Marina Kuzminchuk <marina.a.kuzminchuk@gmail.com>
+Date: Sun, 1 Nov 2026 16:21:04 +0100
+Subject: [PATCH 4/5] fix: give each peer its own album grouping keys in
+ straight-forward
+
+sendToMultiplePeers enqueued the same messages, with the same
+localGroupingKey, for every selected peer. PendingMessageManager collects
+an album by grouping key alone, across peers, and sends the whole group to
+the first message's peer, so a two-photo album forwarded to Saved Messages
+and a contact arrived in Saved Messages twice and not at the contact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/MediaPickerScreen.swift           | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift b/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
+index 1d87e8665a..5a269d0610 100644
+--- a/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
++++ b/submodules/MediaPickerUI/Sources/MediaPickerScreen.swift
+@@ -3515,7 +3515,24 @@ final class MediaPickerContext: AttachmentMediaPickerContext {
+                 }
+             }
+             for peer in peers {
+-                let _ = enqueueMessages(account: context.account, peerId: peer.id, messages: messages).startStandalone()
++                // PendingMessageManager collects an album by grouping key alone, across peers, and
++                // sends it to the first message's peer. Sharing keys between peers would merge every
++                // peer's copy of the album into one request to a single chat, so remap them per peer.
++                var groupingKeys: [Int64: Int64] = [:]
++                let peerMessages = messages.map { message in
++                    message.withUpdatedGroupingKey { groupingKey in
++                        guard let groupingKey else {
++                            return nil
++                        }
++                        if let mapped = groupingKeys[groupingKey] {
++                            return mapped
++                        }
++                        let mapped = Int64.random(in: Int64.min ... Int64.max)
++                        groupingKeys[groupingKey] = mapped
++                        return mapped
++                    }
++                }
++                let _ = enqueueMessages(account: context.account, peerId: peer.id, messages: peerMessages).startStandalone()
+             }
+             completion()
+         })
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 7d5e8feb0ec79b633e7bdd77f4c44b0d184b8bea Mon Sep 17 00:00:00 2001
+From: Marina Kuzminchuk <marina.a.kuzminchuk@gmail.com>
+Date: Sun, 1 Nov 2026 16:21:05 +0100
+Subject: [PATCH 5/5] fix: straight-forward caption, input and sender-name
+ handling
+
+- Forwarding from attachments applies the peer picker's caption only when
+  it was edited there. A set caption overrides every item's own caption,
+  so forwarding from the full-screen gallery (which starts with an empty
+  caption) erased captions typed on the photos.
+- Clear the chat input after forwarding from attachments, as a normal
+  media send does; its text was carried into the caption and sent.
+- Hide "Forwarded from" only when every message was authored by the
+  account and is not itself a forward (the old check compared the chat,
+  so it only worked from Saved Messages), and respect sender visibility
+  chosen explicitly in the forward options.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/ChatControllerBroadcastMessage.swift    | 10 +++++++++-
+ .../Sources/ChatControllerForwardMessages.swift     | 13 +++++++++----
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+index 47be7d8951..0ce6ad63c2 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerBroadcastMessage.swift
+@@ -212,10 +212,18 @@ extension ChatControllerImpl {
+             guard !peers.isEmpty else { return }
+             strongController.dismiss()
+ 
++            // The chat's input text was carried into the attachment caption, so it has been sent now.
++            strongSelf.clearInputText()
++
+             let sendMode: AttachmentMediaPickerSendMode = mode == .silent ? .silently : .generic
+ 
+             if let mediaPickerContext = mediaPickerContext {
+-                mediaPickerContext.setCaption(editedText)
++                // A set caption overrides every item's own caption, so only apply it when the user
++                // edited it in the peer picker; otherwise per-item captions (e.g. typed in the
++                // full-screen gallery, which starts the forward with an empty caption) are kept.
++                if !editedText.isEqual(to: captionText) {
++                    mediaPickerContext.setCaption(editedText)
++                }
+                 mediaPickerContext.sendToMultiplePeers(peers, mode: sendMode, context: context, completion: {
+                     dismissAttachment()
+                 })
+diff --git a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+index d4f01be110..8b5c82f72e 100644
+--- a/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
++++ b/submodules/TelegramUI/Sources/ChatControllerForwardMessages.swift
+@@ -157,10 +157,15 @@ extension ChatControllerImpl {
+                         }
+                         
+                         var attributes: [EngineMessage.Attribute] = []
+-                        // When all forwarded messages are your own, never show "Forwarded from: you".
+-                        let accountPeerId = context.account.peerId
+-                        let hasNotOwnMessages = messages.contains { $0.id.peerId != accountPeerId || $0.forwardInfo != nil }
+-                        let shouldHideNames = !hasNotOwnMessages || (forwardOptions?.hideNames == true)
++                        // When all forwarded messages are your own, don't show "Forwarded from: you",
++                        // unless the user explicitly chose sender visibility in the forward options.
++                        let shouldHideNames: Bool
++                        if let forwardOptions {
++                            shouldHideNames = forwardOptions.hideNames
++                        } else {
++                            let accountPeerId = context.account.peerId
++                            shouldHideNames = messages.allSatisfy { $0.author?.id == accountPeerId && $0.forwardInfo == nil }
++                        }
+                         attributes.append(ForwardOptionsMessageAttribute(hideNames: shouldHideNames, hideCaptions: forwardOptions?.hideCaptions == true))
+                         
+                         result.append(contentsOf: messages.map { message -> EnqueueMessage in
+-- 
+2.50.1 (Apple Git-155)
+
